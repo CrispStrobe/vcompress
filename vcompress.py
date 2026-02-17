@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-compress3.py — Cross-Platform Chunked Video Compressor v5.0
-Production-grade Atomos forensic recovery with multi-backend audio extraction.
+vcompress.py — Cross-Platform Chunked Video Compressor
+with forensic recovery capabilities and multi-backend audio extraction.
 
 Key Features:
 - Hardware acceleration: VideoToolbox, NVENC, AMF, QSV, VAAPI
@@ -12,15 +12,15 @@ Key Features:
 - Cross-platform (macOS, Linux, Windows)
 
 Usage examples:
-  python compress3.py .                          # compress all high-bitrate files
-  python compress3.py video.mov --onlyaudio      # extract audio only
-  python compress3.py . --audio-format flac      # extract to FLAC
-  python compress3.py . --output-format mkv      # output MKV
-  python compress3.py . --from 1:30 --to 5:00    # trim to range
-  python compress3.py . --audio-backend vlc      # force VLC
-  python compress3.py . --forensic               # enable all forensic techniques
-  python compress3.py . --list-backends          # show detected tools
-  python compress3.py . -vvv                     # ultra-verbose mode
+  python vcompress.py .                          # compress all high-bitrate files
+  python vcompress.py video.mov --onlyaudio      # extract audio only
+  python vcompress.py . --audio-format flac      # extract to FLAC
+  python vcompress.py . --output-format mkv      # output MKV
+  python vcompress.py . --from 1:30 --to 5:00    # trim to range
+  python vcompress.py . --audio-backend vlc      # force VLC
+  python vcompress.py . --forensic               # enable all forensic techniques
+  python vcompress.py . --list-backends          # show detected tools
+  python vcompress.py . -vvv                     # ultra-verbose mode
 """
 
 import os
@@ -1484,7 +1484,7 @@ import shlex
 
 def main():
     parser = argparse.ArgumentParser(
-        description="compress3.py — Cross-Platform Chunked Video Compressor v5.0",
+        description="vcompress.py — Cross-Platform Chunked Video Compressor v5.0",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Time format (--from / --to / --trimfront / --trimback):
@@ -1622,7 +1622,7 @@ Verbosity levels:
     enc_disp = (encoders or {}).get('video') or 'n/a'
     sw_note  = f"  {C.YELLOW}(software){C.RESET}" if (encoders or {}).get('is_software') else ""
     cprint(C.BOLD + C.WHITE, f"\n{'─'*62}")
-    cprint(C.BOLD + C.WHITE,  "  compress3.py — Cross-Platform Video Compressor v5.0")
+    cprint(C.BOLD + C.WHITE,  "  vcompress.py — Cross-Platform Video Compressor v5.0")
     cprint(C.BOLD + C.WHITE, f"{'─'*62}")
     print(f"  Platform     : {platform.system()} {platform.machine()}"
           f"  [{(encoders or {}).get('label','?')}]")
