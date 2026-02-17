@@ -640,7 +640,107 @@ def _backend_ffmpeg(filepath: str, out: str, duration: float, args, ainfo: Dict)
     
     return False
 
+def _backend_quicktime(filepath: str, out: str, duration: float, args, ainfo: Dict) -> bool:
+    """
+    macOS ONLY: Automates QuickTime Player via AppleScript to export audio.
+    Great fallback for files that play in Finder but fail in FFmpeg.
+    """
+    if platform.system() != 'Darwin':
+        log("QuickTime backend is macOS only.", args.verbose, 1)
+        return False
 
+    # QuickTime exports to m4a (AAC) by default for 'Audio Only'
+    # We will export to a temp m4a, then convert to target format if needed.
+    
+    # Resolve temp directory
+    if getattr(args, 'tmpdir', None):
+        tmp_dir = Path(args.tmpdir).resolve()
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        tmp_dir = Path(out).parent.resolve()
+
+    qt_out = tmp_dir / f"qt_export_{int(time.time())}.m4a"
+    abs_input = str(Path(filepath).resolve())
+    abs_qt_out = str(qt_out)
+
+    # AppleScript to drive QuickTime
+    # Note: 'export' command in recent macOS QT Player is often limited to specific presets.
+    # We use 'export' with 'Audio Only' preset.
+    script = f"""
+    tell application "QuickTime Player"
+        activate
+        try
+            close every window
+        end try
+        open POSIX file "{abs_input}"
+        set doc to first document
+        
+        -- Wait for it to load
+        delay 2
+        
+        -- Export Audio Only
+        export doc in POSIX file "{abs_qt_out}" using settings preset "Audio Only"
+        
+        -- Wait for export to finish (simple loop)
+        -- Note: AppleScript waits for the export command to return
+        
+        close doc saving no
+        quit
+    end tell
+    """
+    
+    if args.dry_run:
+        print(f"  {C.DIM}[DRY:QuickTime] AppleScript export to {qt_out}{C.RESET}")
+        return True
+
+    log(f"QuickTime: Exporting via AppleScript...", args.verbose, 1)
+    
+    try:
+        # Run AppleScript
+        p = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+        
+        if args.verbose >= 2:
+            if p.stdout: log(f"QuickTime stdout: {p.stdout.strip()}", args.verbose, 3)
+            if p.stderr: log(f"QuickTime stderr: {p.stderr.strip()}", args.verbose, 3)
+
+        if p.returncode != 0:
+            log(f"QuickTime AppleScript failed (code {p.returncode})", args.verbose, 1)
+            return False
+
+        # Wait for file to appear and stabilize
+        attempts = 0
+        while not qt_out.exists() or qt_out.stat().st_size == 0:
+            time.sleep(1)
+            attempts += 1
+            if attempts > 30: # 30s timeout for file creation
+                log("QuickTime export timed out (file not created)", args.verbose, 1)
+                return False
+
+        log(f"QuickTime export successful: {qt_out.name}", args.verbose, 2)
+
+        # Convert/Trim the M4A to final output
+        # (QuickTime output is untrimmed M4A)
+        trim = _trim_flags(args, duration)
+        ext, codec, quality = _afmt(args)
+        
+        cmd_conv = ['ffmpeg', '-hide_banner', '-loglevel', 'warning',
+                    '-i', str(qt_out), *trim, 
+                    '-c:a', codec, *quality, '-y', out]
+
+        log(f"QT-M4A -> {ext}: {' '.join(cmd_conv)}", args.verbose, 2)
+        ok = run_ffmpeg_progress(cmd_conv, _trim_dur(args, duration), 
+                                label="qt-conv           ", verbose=args.verbose)
+        
+        # Cleanup temp M4A
+        if qt_out.exists():
+            qt_out.unlink()
+
+        return ok and _sz(out) > 10_000
+
+    except Exception as e:
+        log(f"QuickTime backend error: {e}", args.verbose, 1)
+        return False
+    
 def _backend_pipe(filepath: str, out: str, duration: float, args, ainfo: Dict) -> bool:
     """
     Two-process pipe: proc1 demuxes raw PCM bytes, proc2 encodes.
@@ -1121,6 +1221,7 @@ def extract_audio(info: FileInfo, args, tools: Dict) -> bool:
         'sox':       lambda: _backend_sox(info.path, out, info.duration_sec, args, tools),
         'pydub':     lambda: _backend_pydub(info.path, out, info.duration_sec, args, tools),
         'lame':      lambda: _backend_lame(info.path, out, info.duration_sec, args, tools),
+        'quicktime': lambda: _backend_quicktime(info.path, out, info.duration_sec, args, ainfo),
         'forensic':  lambda: _backend_forensic_pipe(info.path, out, info.duration_sec, args),
     }
 
@@ -1157,6 +1258,11 @@ def extract_audio(info: FileInfo, args, tools: Dict) -> bool:
         if not ok and tools.get('vlc'):
             print(f"  {C.YELLOW}[3/4] VLC transcode engine...{C.RESET}")
             ok = _backend_vlc(info.path, out, info.duration_sec, args, tools)
+
+        # Phase 3.5: QuickTime (macOS only, reliable for Finder-playable files)
+        if not ok and platform.system() == 'Darwin':
+             print(f"  {C.YELLOW}[3.5/5] QuickTime Player Automation...{C.RESET}")
+             ok = _backend_quicktime(info.path, out, info.duration_sec, args, ainfo)
         
         # Phase 4: Forensic pipe (nuclear option)
         if not ok and forensic_mode:
@@ -1430,7 +1536,7 @@ Verbosity levels:
     parser.add_argument("--audio-format",  choices=list(AUDIO_FORMATS), default="mp3",
                         help="Audio output format (default: mp3)")
     parser.add_argument("--audio-backend",
-                        choices=['ffmpeg','pipe','afconvert','vlc','sox','pydub','lame','forensic'],
+                        choices=['ffmpeg','pipe','afconvert','vlc','sox','pydub','lame','forensic','quicktime'],
                         help="Force specific audio backend")
     parser.add_argument("--pipe",          action="store_true",
                         help="Force two-process pipe mode for audio")
