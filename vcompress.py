@@ -264,14 +264,18 @@ def detect_encoders(preferred_codec: str, verbose: int) -> Optional[Dict]:
 
 def build_quality_flags(enc: str, crf: int) -> List[str]:
     if 'videotoolbox' in enc:  return ['-q:v', str(int(100 - crf * 1.5))]
-    if 'nvenc' in enc or 'amf' in enc: return ['-rc', 'vbr', '-cq', str(crf)]
+    
+    if 'nvenc' in enc:         return ['-rc', 'constqp', '-qp', str(crf)]
+    
+    if 'amf' in enc:           return ['-rc', 'vbr', '-cq', str(crf)]
+
     if 'qsv'  in enc:          return ['-global_quality', str(crf)]
     if 'vaapi' in enc:         return ['-compression_level', str(crf)]
     return ['-crf', str(crf)]
 
 def build_hwaccel_flags(enc: str) -> List[str]:
     if 'videotoolbox' in enc: return ['-hwaccel', 'videotoolbox']
-    if 'nvenc' in enc:        return ['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda']
+    if 'nvenc' in enc:        return [] 
     if 'qsv'  in enc:         return ['-hwaccel', 'qsv']
     if 'vaapi' in enc:        return ['-hwaccel', 'vaapi', '-vaapi_device', '/dev/dri/renderD128']
     return []
@@ -461,13 +465,17 @@ def _render_bar(cur: float, total: float, fps: float, speed: float,
 
 def run_ffmpeg_progress(cmd: List[str], total_sec: float,
                         label: str = "", verbose: int = 0) -> bool:
-    """Run ffmpeg, render live progress bar from its stderr. Returns True on success."""
+    """
+    Run ffmpeg, render live progress bar from its stderr. 
+    Robustly parses time, fps, and speed individually.
+    """
     if verbose >= 1:
         cmd_str = ' '.join(shlex.quote(str(x)) if ' ' in str(x) else str(x) for x in cmd)
         log(f"Command: {cmd_str}", verbose, 1)
 
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        # bufsize=0 ensures unbuffered output for smoother updates
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, bufsize=0)
     except FileNotFoundError:
         print(f"{C.RED}  [!] ffmpeg not found{C.RESET}")
         return False
@@ -477,56 +485,80 @@ def run_ffmpeg_progress(cmd: List[str], total_sec: float,
     buf     = b""
     error_lines = []
 
+    # File descriptor for stderr
+    stderr_fd = proc.stderr.fileno()
+
     while True:
+        # Non-blocking read can be tricky, so we read byte-by-byte or small chunks
+        # Standard blocking read is usually fine for ffmpeg stderr
         chunk = proc.stderr.read(256)
         if not chunk: break
+        
         buf += chunk
+        
         while b'\r' in buf or b'\n' in buf:
-            for sep in (b'\r', b'\n'):
-                idx = buf.find(sep)
-                if idx == -1: continue
-                line_b = buf[:idx]
-                buf = buf[idx+1:]
-                line   = line_b.decode('utf-8', errors='replace').strip()
-                if not line: continue
+            # Handle both newline types
+            match = re.search(b'[\r\n]', buf)
+            if not match: break
+            idx = match.start()
+            
+            line_b = buf[:idx]
+            buf = buf[match.end():]
+            line   = line_b.decode('utf-8', errors='replace').strip()
+            
+            if not line: continue
 
-                is_stats = 'time=' in line and 'frame=' in line
-                is_bad   = any(x in line.lower() for x in (
-                    'error', 'invalid', 'failed', 'overread',
-                    'guessed', 'no filtered', 'nothing was encoded'))
-                is_warn  = 'warning' in line.lower()
+            # Check for errors/warnings
+            is_bad   = any(x in line.lower() for x in (
+                'error', 'invalid', 'failed', 'overread',
+                'guessed', 'no filtered', 'nothing was encoded'))
+            is_warn  = 'warning' in line.lower()
 
-                if is_bad or is_warn:
-                    error_lines.append(line)
+            # --- ROBUST PARSING LOGIC ---
+            if 'time=' in line and 'frame=' in line:
+                try:
+                    # 1. Parse Time (Critical)
+                    t_match = re.search(r'time=\s*([\d:.]+)', line)
+                    if t_match:
+                        cur = _hms_to_sec(t_match.group(1))
+
+                    # 2. Parse FPS (Optional)
+                    f_match = re.search(r'fps=\s*([\d.]+)', line)
+                    if f_match:
+                        fps = float(f_match.group(1))
+
+                    # 3. Parse Speed (Optional)
+                    s_match = re.search(r'speed=\s*([\d.]+)x', line)
+                    if s_match:
+                        speed = float(s_match.group(1))
                     
-                if (is_bad or is_warn or (verbose >= 2 and not is_stats)):
-                    color = (C.RED if 'error' in line.lower() or 'failed' in line.lower()
-                             else C.YELLOW if is_bad or is_warn else C.GREY)
-                    sys.stdout.write(f"\n  {color}[ffmpeg] {line}{C.RESET}")
-                    sys.stdout.flush()
-                    if not is_stats: continue
+                    # 4. Parse Bitrate (Optional)
+                    b_match = re.search(r'bitrate=\s*(\S+)', line)
+                    if b_match:
+                        bitrate = b_match.group(1)
 
-                m = _STATS_RE.search(line)
-                if m:
-                    try: fps  = float(m.group(2))
-                    except ValueError: pass
-                    try: cur  = _hms_to_sec(m.group(3))
-                    except Exception: pass
-                    bitrate = m.group(4)
-                    try: speed = float(m.group(5))
-                    except ValueError: pass
-                else:
-                    tm = _TIME_RE.search(line)
-                    if tm:
-                        try: cur = _hms_to_sec(tm.group(1))
-                        except Exception: pass
+                    # Update Bar
+                    if cur > 0 and total_sec > 0:
+                        _render_bar(cur, total_sec, fps, speed, bitrate, label)
+                        
+                except Exception:
+                    pass # Skip malformed lines, don't crash
+                
+                # Don't print stats lines to log unless ultra-verbose
+                continue 
 
-                if cur > 0 and total_sec > 0:
-                    _render_bar(cur, total_sec, fps, speed, bitrate, label)
-                break
+            if is_bad or is_warn:
+                error_lines.append(line)
+                
+            if (is_bad or is_warn or (verbose >= 2)):
+                color = (C.RED if 'error' in line.lower() or 'failed' in line.lower()
+                         else C.YELLOW if is_bad or is_warn else C.GREY)
+                sys.stdout.write(f"\n  {color}[ffmpeg] {line}{C.RESET}")
+                sys.stdout.flush()
 
     proc.wait()
-    if total_sec > 0: _render_bar(total_sec, total_sec, fps, speed, bitrate, label)
+    if total_sec > 0: 
+        _render_bar(total_sec, total_sec, fps, speed, bitrate, label)
     sys.stdout.write("\n")
     
     if proc.returncode not in (0, None):
@@ -1314,7 +1346,6 @@ def compress_video_chunked(info: FileInfo, args, encoders: Dict):
     trim_dur = trim_end - trim_start
 
     # Output container
-    # Directories and Paths
     vfmt = (getattr(args, 'output_format', None) or 'mp4').lower()
     vext, vmux_flags = VIDEO_FORMATS.get(vfmt, VIDEO_FORMATS['mp4'])
     stem       = Path(info.path).stem
@@ -1343,18 +1374,24 @@ def compress_video_chunked(info: FileInfo, args, encoders: Dict):
 
     chunks_dir.mkdir(parents=True, exist_ok=True)
 
-    enc           = encoders['video']
-    chunk_sec     = args.chunk_minutes * 60
-    n_chunks      = max(1, -(-int(trim_dur) // int(chunk_sec)))
+    enc               = encoders['video']
+    chunk_sec         = args.chunk_minutes * 60
+    n_chunks          = max(1, -(-int(trim_dur) // int(chunk_sec)))
     quality_flags = build_quality_flags(enc, args.crf)
     hwaccel_flags = build_hwaccel_flags(enc)
 
+    # FIX: Logic to handle Pixel Formats (ProRes 422 -> NVENC 420)
     hdr_flags = []
+    pix_fmt   = ['-pix_fmt', 'yuv420p'] # Default to standard 8-bit 4:2:0 for compatibility
+    
     if info.is_hdr:
         print(f"  {C.YELLOW}[!] HDR — preserving BT.2020/SMPTE2084{C.RESET}")
         hdr_flags = ['-color_primaries', 'bt2020',
                      '-color_trc',       'smpte2084',
                      '-colorspace',      'bt2020nc']
+        # If encoding HEVC HDR, we need 10-bit pixel format
+        if 'hevc' in enc:
+            pix_fmt = ['-pix_fmt', 'p010le'] 
 
     if trim_start > 0 or trim_end < info.duration_sec:
         print(f"  {C.CYAN}[✂] Trim: {sec_to_ts(trim_start)} → {sec_to_ts(trim_end)}"
@@ -1393,6 +1430,7 @@ def compress_video_chunked(info: FileInfo, args, encoders: Dict):
             '-ss', sec_to_ts(abs_start),
             '-t',  str(duration),
             '-i',  str(info.path),
+            *pix_fmt, # FIX: Apply pixel format conversion here
             '-c:v', enc, *quality_flags, *hdr_flags,
             '-c:a', 'aac', '-b:a', '192k',
             *vmux_flags,
@@ -1437,7 +1475,7 @@ def compress_video_chunked(info: FileInfo, args, encoders: Dict):
         print(f"  {C.DIM}[DRY] {' '.join(concat_cmd)}{C.RESET}")
         return
 
-    ok = run_ffmpeg_progress(concat_cmd, trim_dur, label="concat        ", verbose=args.verbose)
+    ok = run_ffmpeg_progress(concat_cmd, trim_dur, label="concat         ", verbose=args.verbose)
 
     if ok and final_out.exists():
         elapsed = time.time() - total_start
